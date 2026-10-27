@@ -1,0 +1,116 @@
+From 9320f519d7c186c23366935f493523f89176c6d2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 10:20:02 -0400
+Subject: [PATCH] UWP: long-session logs: memory peak and minutes, texture
+ memory, pipeline count
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ src/core/platform_uwp.cpp               | 21 +++++++++++++++------
+ src/graphics/d3d12/pipeline_cache.cpp   |  7 ++++---
+ src/graphics/pipeline/texture/cache.cpp | 13 +++++++++++++
+ 3 files changed, 32 insertions(+), 9 deletions(-)
+
+diff --git a/src/core/platform_uwp.cpp b/src/core/platform_uwp.cpp
+index f9652cf..a2c3226 100644
+--- a/src/core/platform_uwp.cpp
++++ b/src/core/platform_uwp.cpp
+@@ -18,6 +18,7 @@
+ #include <windows.storage.h>
+ #include <windows.system.h>
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <cstdint>
+@@ -436,21 +437,29 @@ void StartMemoryUsageLogging() {
+       REXLOG_WARN("UWP: memory usage isn't available (Windows.System.MemoryManager)");
+       return;
+     }
+-    // Every 10 seconds, and right away when usage crosses another 10% of the
+-    // limit: an app over its limit is ended by the system without a crash.
++    // Every 30 seconds (with the peak since the start, for long sessions),
++    // and right away when usage crosses another 10% of the limit: an app over
++    // its limit is ended by the system without a crash.
+     uint64_t last_logged_tenth = UINT64_MAX;
+-    auto last_log = std::chrono::steady_clock::now() - std::chrono::seconds(10);
++    uint64_t peak = 0;
++    const auto start = std::chrono::steady_clock::now();
++    auto last_log = start - std::chrono::seconds(30);
+     while (true) {
+       UINT64 usage = 0, limit = 0;
+       memory_manager->get_AppMemoryUsage(&usage);
+       memory_manager->get_AppMemoryUsageLimit(&limit);
++      peak = std::max<uint64_t>(peak, usage);
+       uint64_t tenth = limit ? usage * 10 / limit : 0;
+       auto now = std::chrono::steady_clock::now();
+-      if (tenth != last_logged_tenth || now - last_log >= std::chrono::seconds(10)) {
++      if (tenth != last_logged_tenth || now - last_log >= std::chrono::seconds(30)) {
++        const auto minutes =
++            std::chrono::duration_cast<std::chrono::minutes>(now - start).count();
+         if (tenth >= 9) {
+-          REXLOG_WARN("UWP: memory {} MB used of {} MB allowed", usage >> 20, limit >> 20);
++          REXLOG_WARN("UWP: memory {} MB used (peak {} MB) of {} MB allowed, {} min in",
++                      usage >> 20, peak >> 20, limit >> 20, minutes);
+         } else {
+-          REXLOG_INFO("UWP: memory {} MB used of {} MB allowed", usage >> 20, limit >> 20);
++          REXLOG_INFO("UWP: memory {} MB used (peak {} MB) of {} MB allowed, {} min in",
++                      usage >> 20, peak >> 20, limit >> 20, minutes);
+         }
+         last_logged_tenth = tenth;
+         last_log = now;
+diff --git a/src/graphics/d3d12/pipeline_cache.cpp b/src/graphics/d3d12/pipeline_cache.cpp
+index 0f23d8d..a6e1abb 100644
+--- a/src/graphics/d3d12/pipeline_cache.cpp
++++ b/src/graphics/d3d12/pipeline_cache.cpp
+@@ -2812,11 +2812,12 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
+   // handle may end the app: the log's last lines then name it.
+   {
+     const PipelineRenderTarget& rt0 = description.render_targets[0];
++    static std::atomic<uint32_t> pipelines_created{0};
+     REXGPU_INFO(
+-        "Creating graphics pipeline {:016X} VS {:016X}/{:X} PS {:016X}/{:X}: topology/tess {} "
+-        "GS {} cull {} MSAA {} depth fmt {} func {} write {} stencil {} RT0 {} fmt {} blend "
++        "Creating graphics pipeline #{} {:016X} VS {:016X}/{:X} PS {:016X}/{:X}: topology/tess "
++        "{} GS {} cull {} MSAA {} depth fmt {} func {} write {} stencil {} RT0 {} fmt {} blend "
+         "{}/{}/{}",
+-        description_hash, runtime_description.vertex_shader->shader().ucode_data_hash(),
++        pipelines_created.fetch_add(1) + 1, description_hash, runtime_description.vertex_shader->shader().ucode_data_hash(),
+         description.vertex_shader_modification,
+         runtime_description.pixel_shader
+             ? runtime_description.pixel_shader->shader().ucode_data_hash()
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index d767124..cfb1dda 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -17,6 +17,7 @@
+ #include <rex/assert.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
++#include <rex/platform.h>
+ #include <rex/dbg.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/pipeline/texture/cache.h>
+@@ -1662,6 +1663,18 @@ void TextureCache::ResetTextureBindings(bool from_destructor) {
+ 
+ void TextureCache::UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t subtract) {
+   textures_total_host_memory_usage_ = textures_total_host_memory_usage_ - subtract + add;
++#if REX_PLATFORM_WINRT
++  {
++    // Logged in 64 MB steps, to see how much of the app's memory textures use.
++    static uint64_t logged_step = 0;
++    const uint64_t step = textures_total_host_memory_usage_ >> 26;
++    if (step != logged_step) {
++      logged_step = step;
++      REXGPU_INFO("Texture cache: {} MB in {} textures",
++                  textures_total_host_memory_usage_ >> 20, textures_.size());
++    }
++  }
++#endif
+   COUNT_profile_set(
+       "gpu/texture_cache/total_host_memory_usage_mb",
+       uint32_t((textures_total_host_memory_usage_ + ((UINT32_C(1) << 20) - 1)) >> 20));
+-- 
+2.43.0
+

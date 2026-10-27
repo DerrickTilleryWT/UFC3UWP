@@ -1,0 +1,66 @@
+From 216a89d4aa115aab287e293a8f312eaebeca1a99 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 01:51:15 -0400
+Subject: [PATCH] UWP: write files through a host buffer in 1 MB pieces
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ src/system/xfile.cpp | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/src/system/xfile.cpp b/src/system/xfile.cpp
+index c1aecbc..49a17f9 100644
+--- a/src/system/xfile.cpp
++++ b/src/system/xfile.cpp
+@@ -15,6 +15,9 @@
+ 
+ #include <atomic>
+ #include <chrono>
++#include <vector>
++#include <cstring>
++#include <algorithm>
+ #include <rex/math.h>
+ #include <rex/memory.h>
+ #include <rex/memory/utils.h>
+@@ -293,9 +296,37 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
+   const auto write_start = std::chrono::steady_clock::now();
+ #endif
+   size_t bytes_written = 0;
++#if REX_PLATFORM_WINRT
++  // On Xbox, a WriteFile reading straight from guest memory has been seen to
++  // never return (a 12 MB replay save). Write through a host buffer instead,
++  // in 1 MB pieces: the copy reads guest memory in user mode, so any page
++  // watch is handled the usual way, and the OS only sees an ordinary heap
++  // buffer.
++  X_STATUS result = X_STATUS_SUCCESS;
++  {
++    const uint8_t* source = memory()->TranslateVirtual(buffer_guest_address);
++    std::vector<uint8_t> bounce(std::min<size_t>(buffer_length, size_t(1) << 20));
++    while (bytes_written < buffer_length) {
++      const size_t piece = std::min(bounce.size(), size_t(buffer_length) - bytes_written);
++      std::memcpy(bounce.data(), source + bytes_written, piece);
++      size_t piece_written = 0;
++      result = file_->WriteSync(std::span<const uint8_t>(bounce.data(), piece),
++                                size_t(byte_offset) + bytes_written, &piece_written);
++      bytes_written += piece_written;
++      if (XFAILED(result) || piece_written != piece) {
++        break;
++      }
++      if (buffer_length >= 4 * 1024 * 1024 && !(bytes_written & ((4 << 20) - 1))) {
++        REXSYS_INFO("File write to {}: {} of {} bytes done", path(), bytes_written,
++                    buffer_length);
++      }
++    }
++  }
++#else
+   X_STATUS result = file_->WriteSync(
+       std::span<const uint8_t>(memory()->TranslateVirtual(buffer_guest_address), buffer_length),
+       size_t(byte_offset), &bytes_written);
++#endif
+   if (XSUCCEEDED(result)) {
+     position_ += bytes_written;
+   }
+-- 
+2.43.0
+

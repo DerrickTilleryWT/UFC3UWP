@@ -1,0 +1,293 @@
+From 68d1009210026a379dd2c312e12976becdbf21e8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 00:54:05 -0400
+Subject: [PATCH] UWP: Back+Start logs every thread's call stack, with game
+ functions named
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ include/rex/platform/uwp.h | 14 ++++++
+ src/core/platform_uwp.cpp  | 88 +++++++++++++++++++++++++++++++++-----
+ src/ui/rex_app.cpp         | 76 ++++++++++++++++++++++++++++++++
+ 3 files changed, 167 insertions(+), 11 deletions(-)
+
+diff --git a/include/rex/platform/uwp.h b/include/rex/platform/uwp.h
+index 0671361..d4948c2 100644
+--- a/include/rex/platform/uwp.h
++++ b/include/rex/platform/uwp.h
+@@ -15,7 +15,9 @@
+ 
+ #if REX_PLATFORM_WINRT
+ 
++#include <cstdint>
+ #include <filesystem>
++#include <string>
+ 
+ namespace rex::platform::uwp {
+ 
+@@ -60,6 +62,18 @@ void InstallCrashLogging();
+ // logging is set up.
+ void StartMemoryUsageLogging();
+ 
++// Names an address in the game's recompiled code (for example
++// "sub_82ABCDEF+0x40"), or returns an empty string. Used by the stack logs.
++using AddressSymbolizer = std::string (*)(uint64_t address);
++void SetAddressSymbolizer(AddressSymbolizer symbolizer);
++
++// Base address of the module (exe or DLL) containing `address`, or 0.
++uint64_t GetModuleBase(uint64_t address);
++
++// Logs another thread's call stack (with `label` on each line). The thread is
++// suspended only while its stack is read. Not for the calling thread.
++void LogThreadStack(void* thread_handle, const std::string& label);
++
+ }  // namespace rex::platform::uwp
+ 
+ #endif  // REX_PLATFORM_WINRT
+diff --git a/src/core/platform_uwp.cpp b/src/core/platform_uwp.cpp
+index 8189d46..f9652cf 100644
+--- a/src/core/platform_uwp.cpp
++++ b/src/core/platform_uwp.cpp
+@@ -236,6 +236,7 @@ using RtlVirtualUnwindFn = void*(NTAPI*)(DWORD handler_type,
+                                          PDWORD64 establisher_frame,
+                                          void* context_pointers);
+ 
++std::atomic<AddressSymbolizer> address_symbolizer_{nullptr};
+ std::atomic<bool> crash_logged_{false};
+ TopLevelFilter previous_filter_ = nullptr;
+ 
+@@ -275,8 +276,15 @@ std::string DescribeAddress(uint64_t address) {
+       }
+     }
+   }
+-  return fmt::format("{}+0x{:X}", name,
+-                     address - reinterpret_cast<uint64_t>(module));
++  std::string described =
++      fmt::format("{}+0x{:X}", name, address - reinterpret_cast<uint64_t>(module));
++  if (AddressSymbolizer symbolizer = address_symbolizer_.load()) {
++    std::string symbol = symbolizer(address);
++    if (!symbol.empty()) {
++      described += " (" + symbol + ")";
++    }
++  }
++  return described;
+ }
+ 
+ bool IsReadable(uint64_t address, size_t size) {
+@@ -294,23 +302,20 @@ bool IsReadable(uint64_t address, size_t size) {
+   return address + size <= region_end;
+ }
+ 
+-// Logs the call stack of the crashed thread, unwinding from its context.
+-void LogStack(const CONTEXT* crash_context) {
++// Collects return addresses by unwinding from a context, without allocating
++// (the thread may be suspended while holding a heap lock).
++size_t WalkStack(CONTEXT context, uint64_t* frames, size_t max_frames) {
+   static const auto lookup =
+       GetSystemProc<RtlLookupFunctionEntryFn>("RtlLookupFunctionEntry");
+   static const auto unwind =
+       GetSystemProc<RtlVirtualUnwindFn>("RtlVirtualUnwind");
+-  if (!crash_context) {
+-    return;
+-  }
+-  CONTEXT context = *crash_context;
+-  CrashLogLine("CRASH: call stack (most recent first):");
+-  for (int frame = 0; frame < 48; ++frame) {
++  size_t count = 0;
++  while (count < max_frames) {
+     uint64_t pc = context.Rip;
+     if (!pc) {
+       break;
+     }
+-    CrashLogLine(fmt::format("CRASH:   #{:02} {}", frame, DescribeAddress(pc)));
++    frames[count++] = pc;
+     if (!lookup || !unwind) {
+       break;
+     }
+@@ -330,6 +335,20 @@ void LogStack(const CONTEXT* crash_context) {
+       context.Rsp += sizeof(uint64_t);
+     }
+   }
++  return count;
++}
++
++// Logs the call stack of the crashed thread, unwinding from its context.
++void LogStack(const CONTEXT* crash_context) {
++  if (!crash_context) {
++    return;
++  }
++  uint64_t frames[48];
++  size_t count = WalkStack(*crash_context, frames, std::size(frames));
++  CrashLogLine("CRASH: call stack (most recent first):");
++  for (size_t frame = 0; frame < count; ++frame) {
++    CrashLogLine(fmt::format("CRASH:   #{:02} {}", frame, DescribeAddress(frames[frame])));
++  }
+ }
+ 
+ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
+@@ -441,6 +460,53 @@ void StartMemoryUsageLogging() {
+   }).detach();
+ }
+ 
++uint64_t GetModuleBase(uint64_t address) {
++  return reinterpret_cast<uint64_t>(ModuleFromAddress(reinterpret_cast<const void*>(address)));
++}
++
++void SetAddressSymbolizer(AddressSymbolizer symbolizer) {
++  address_symbolizer_.store(symbolizer);
++}
++
++void LogThreadStack(void* thread_handle, const std::string& label) {
++  using SuspendResumeThreadFn = DWORD(WINAPI*)(HANDLE);
++  using GetThreadContextFn = BOOL(WINAPI*)(HANDLE, LPCONTEXT);
++  static const auto suspend_thread = GetSystemProc<SuspendResumeThreadFn>("SuspendThread");
++  static const auto resume_thread = GetSystemProc<SuspendResumeThreadFn>("ResumeThread");
++  static const auto get_thread_context = GetSystemProc<GetThreadContextFn>("GetThreadContext");
++  auto log_line = [](const std::string& line) {
++    if (auto logger = rex::GetLogger()) {
++      logger->info("{}", line);
++    }
++  };
++  if (!suspend_thread || !resume_thread || !get_thread_context || !thread_handle) {
++    log_line(fmt::format("{}: can't read the stack (thread functions missing)", label));
++    return;
++  }
++  HANDLE handle = static_cast<HANDLE>(thread_handle);
++  if (suspend_thread(handle) == DWORD(-1)) {
++    log_line(fmt::format("{}: can't suspend the thread (error {})", label, GetLastError()));
++    return;
++  }
++  uint64_t frames[40];
++  size_t count = 0;
++  alignas(16) CONTEXT context = {};
++  context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
++  bool have_context = get_thread_context(handle, &context) != FALSE;
++  DWORD context_error = have_context ? 0 : GetLastError();
++  if (have_context) {
++    count = WalkStack(context, frames, std::size(frames));
++  }
++  resume_thread(handle);
++  if (!have_context) {
++    log_line(fmt::format("{}: can't read the thread context (error {})", label, context_error));
++    return;
++  }
++  for (size_t frame = 0; frame < count; ++frame) {
++    log_line(fmt::format("{}   #{:02} {}", label, frame, DescribeAddress(frames[frame])));
++  }
++}
++
+ }  // namespace rex::platform::uwp
+ 
+ #endif  // REX_PLATFORM_WINRT
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index b9b2b38..fc3901b 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -31,6 +31,11 @@
+ #include <rex/platform.h>
+ #if REX_PLATFORM_WINRT
+ #include <rex/audio/xaudio2/xaudio2_audio_system.h>
++#include <rex/platform/uwp.h>
++#include <rex/ppc/func.h>
++#include <thread>
++#include <utility>
++#include <vector>
+ #else
+ #include <rex/audio/sdl/sdl_audio_system.h>
+ #endif
+@@ -60,6 +65,64 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
+ 
+ namespace rex {
+ 
++#if REX_PLATFORM_WINRT
++namespace {
++// Host address of each recompiled guest function, sorted, for naming the
++// game's code in stack logs ("sub_82ABCDEF+0x40").
++std::vector<std::pair<uint64_t, uint32_t>> guest_function_starts_;
++uint64_t guest_code_module_ = 0;
++
++std::string SymbolizeGuestCode(uint64_t address) {
++  if (guest_function_starts_.empty() || rex::platform::uwp::GetModuleBase(address) != guest_code_module_) {
++    return {};
++  }
++  auto it = std::upper_bound(guest_function_starts_.begin(), guest_function_starts_.end(),
++                             std::make_pair(address, UINT32_MAX));
++  if (it == guest_function_starts_.begin()) {
++    return {};
++  }
++  --it;
++  return fmt::format("sub_{:08X}+0x{:X}", it->second, address - it->first);
++}
++
++void BuildGuestFunctionTable(const PPCFuncMapping* mappings) {
++  if (!mappings || !guest_function_starts_.empty()) {
++    return;
++  }
++  for (size_t i = 0; mappings[i].guest != 0; ++i) {
++    if (mappings[i].host) {
++      guest_function_starts_.emplace_back(reinterpret_cast<uint64_t>(mappings[i].host),
++                                          uint32_t(mappings[i].guest));
++    }
++  }
++  std::sort(guest_function_starts_.begin(), guest_function_starts_.end());
++  if (!guest_function_starts_.empty()) {
++    guest_code_module_ = rex::platform::uwp::GetModuleBase(guest_function_starts_.front().first);
++    rex::platform::uwp::SetAddressSymbolizer(&SymbolizeGuestCode);
++  }
++}
++
++// Logs where every game and emulator thread is right now. Used to see what a
++// stuck game waits for (Back+Start on the pad).
++void LogAllThreadStacks(system::KernelState* kernel_state) {
++  if (!kernel_state) {
++    return;
++  }
++  auto threads = kernel_state->object_table()->GetObjectsByType<system::XThread>();
++  REXLOG_INFO("Thread stacks ({} threads):", threads.size());
++  for (auto& thread : threads) {
++    if (!thread || !thread->is_running() || !thread->thread()) {
++      continue;
++    }
++    rex::platform::uwp::LogThreadStack(
++        thread->thread()->native_handle(),
++        fmt::format("[stack] {}", thread->thread()->name()));
++  }
++  REXLOG_INFO("Thread stacks: end");
++}
++}  // namespace
++#endif
++
+ // --- ReXApp ---
+ 
+ ReXApp::~ReXApp() = default;
+@@ -291,6 +354,15 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+             rex::input::X_INPUT_GAMEPAD_BACK | rex::input::X_INPUT_GAMEPAD_START;
+         const bool combo = (b & kCombo) == kCombo;
+         const bool was_combo = pad_combo_down_.exchange(combo);
++#if REX_PLATFORM_WINRT
++        if (combo && !was_combo && runtime_) {
++          // A separate thread, so no thread whose stack is read is the one
++          // reading it.
++          std::thread([kernel_state = runtime_->kernel_state()] {
++            LogAllThreadStacks(kernel_state);
++          }).detach();
++        }
++#endif
+         if (combo && !was_combo && toggle_settings_) {
+           REXLOG_INFO("Pad: Back+Start toggles settings overlay");
+           app_context().CallInUIThreadDeferred([this] { toggle_settings_(); });
+@@ -306,6 +378,10 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+     }
+   }
+ 
++#if REX_PLATFORM_WINRT
++  BuildGuestFunctionTable(ppc_info_.func_mappings);
++#endif
++
+   std::string xex_image = "game:\\default.xex";
+   OnLoadXexImage(xex_image);
+ 
+-- 
+2.43.0
+

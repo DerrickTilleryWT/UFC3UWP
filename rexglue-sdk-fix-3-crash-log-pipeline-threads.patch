@@ -1,0 +1,115 @@
+From 4a24a11473a6d5fe4342784790c6c67a3272376c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 20:40:25 -0400
+Subject: [PATCH] UWP: crash reports and memory log through the core logger; 2
+ pipeline threads
+
+spdlog's default logger isn't the core (file) logger in this SDK version, so
+crash reports and memory usage only reached the debugger. Limit pipeline
+creation threads on UWP: the Xbox shader compiler is memory hungry.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ src/core/logging.cpp                  |  8 ++++++++
+ src/core/platform_uwp.cpp             | 18 ++++++++++++++----
+ src/graphics/d3d12/pipeline_cache.cpp | 12 ++++++++++--
+ 3 files changed, 32 insertions(+), 6 deletions(-)
+
+diff --git a/src/core/logging.cpp b/src/core/logging.cpp
+index 7e43774..d586948 100644
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -209,6 +209,14 @@ std::shared_ptr<spdlog::logger> CreateCategoryLogger(const std::string& name) {
+ }  // namespace
+ 
+ void ReportFatalErrorToLog(const char* message) {
++  // The core category logger has the log file; spdlog's default logger may
++  // not.
++  std::shared_ptr<spdlog::logger> core_logger = GetLogger(rex::log::core());
++  if (core_logger) {
++    core_logger->critical("FATAL: {}", message ? message : "(no message)");
++    core_logger->flush();
++    return;
++  }
+   if (auto* logger = spdlog::default_logger_raw()) {
+     logger->critical("FATAL: {}", message ? message : "(no message)");
+     logger->flush();
+diff --git a/src/core/platform_uwp.cpp b/src/core/platform_uwp.cpp
+index c4ed5fb..8189d46 100644
+--- a/src/core/platform_uwp.cpp
++++ b/src/core/platform_uwp.cpp
+@@ -30,6 +30,8 @@
+ #include <fmt/format.h>
+ #include <spdlog/spdlog.h>
+ 
++#include <rex/logging.h>
++
+ namespace rex::platform::uwp {
+ 
+ namespace {
+@@ -238,9 +240,14 @@ std::atomic<bool> crash_logged_{false};
+ TopLevelFilter previous_filter_ = nullptr;
+ 
+ void CrashLogLine(const std::string& line) {
+-  if (auto* logger = spdlog::default_logger_raw()) {
++  // The core category logger (it has the log file; spdlog's default logger
++  // may not).
++  if (auto logger = rex::GetLogger()) {
+     logger->critical("{}", line);
+     logger->flush();
++  } else if (auto* fallback = spdlog::default_logger_raw()) {
++    fallback->critical("{}", line);
++    fallback->flush();
+   }
+ }
+ 
+@@ -407,7 +414,7 @@ void StartMemoryUsageLogging() {
+                                             &class_name_header, &class_name)) ||
+         FAILED(RoGetActivationFactory(class_name,
+                                       IID_PPV_ARGS(memory_manager.GetAddressOf())))) {
+-      spdlog::warn("UWP: memory usage isn't available (Windows.System.MemoryManager)");
++      REXLOG_WARN("UWP: memory usage isn't available (Windows.System.MemoryManager)");
+       return;
+     }
+     // Every 10 seconds, and right away when usage crosses another 10% of the
+@@ -421,8 +428,11 @@ void StartMemoryUsageLogging() {
+       uint64_t tenth = limit ? usage * 10 / limit : 0;
+       auto now = std::chrono::steady_clock::now();
+       if (tenth != last_logged_tenth || now - last_log >= std::chrono::seconds(10)) {
+-        auto log = tenth >= 9 ? spdlog::level::warn : spdlog::level::info;
+-        spdlog::log(log, "UWP: memory {} MB used of {} MB allowed", usage >> 20, limit >> 20);
++        if (tenth >= 9) {
++          REXLOG_WARN("UWP: memory {} MB used of {} MB allowed", usage >> 20, limit >> 20);
++        } else {
++          REXLOG_INFO("UWP: memory {} MB used of {} MB allowed", usage >> 20, limit >> 20);
++        }
+         last_logged_tenth = tenth;
+         last_log = now;
+       }
+diff --git a/src/graphics/d3d12/pipeline_cache.cpp b/src/graphics/d3d12/pipeline_cache.cpp
+index f44862a..a8bb7c2 100644
+--- a/src/graphics/d3d12/pipeline_cache.cpp
++++ b/src/graphics/d3d12/pipeline_cache.cpp
+@@ -54,8 +54,16 @@ REXCVAR_DEFINE_BOOL(d3d12_dxbc_disasm, false, "GPU/D3D12", "Dump DXBC disassembl
+ REXCVAR_DEFINE_BOOL(d3d12_dxbc_disasm_dxilconv, false, "GPU/D3D12",
+                     "Dump DXIL conversion disassembly");
+ 
+-REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
+-                     "Number of pipeline creation threads (-1 for auto)")
++#if REX_PLATFORM_WINRT
++// Xbox: the console's shader compiler, which runs inside the app for every
++// pipeline, needs a lot of memory; many at once can push a UWP game over its
++// memory limit (it's then ended without a crash report).
++#define REX_D3D12_PIPELINE_CREATION_THREADS_DEFAULT 2
++#else
++#define REX_D3D12_PIPELINE_CREATION_THREADS_DEFAULT -1
++#endif
++REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, REX_D3D12_PIPELINE_CREATION_THREADS_DEFAULT,
++                     "GPU/D3D12", "Number of pipeline creation threads (-1 for auto)")
+     .range(-1, 32)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+-- 
+2.43.0
+

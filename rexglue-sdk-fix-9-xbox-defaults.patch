@@ -1,0 +1,90 @@
+From 7385f9dadafdf820b67d0d81f3fd8ffce8eba512 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 16:02:55 -0400
+Subject: [PATCH] UWP: Xbox shader settings by default (no DXBC switch, no
+ shader storage); texture log only at new highs
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ src/graphics/graphics_system.cpp                 | 10 +++++++++-
+ src/graphics/pipeline/shader/dxbc_translator.cpp |  8 ++++++++
+ src/graphics/pipeline/texture/cache.cpp          |  6 ++++--
+ 3 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 8f2fcb0..ba610bd 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -20,6 +20,7 @@
+ #include <utility>
+ 
+ #include <rex/cvar.h>
++#include <rex/platform.h>
+ #include <rex/graphics/command_processor.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/kernel/xboxkrnl/video.h>
+@@ -35,7 +36,14 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none,
+     .allowed({"none", "fxaa", "fxaa_extreme"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+-REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
++// Xbox (UWP): the console's graphics driver has crashed creating stored
++// pipelines at startup, so shaders are built fresh every run there.
++#if REX_PLATFORM_WINRT
++#define REX_STORE_SHADERS_DEFAULT false
++#else
++#define REX_STORE_SHADERS_DEFAULT true
++#endif
++REXCVAR_DEFINE_BOOL(store_shaders, REX_STORE_SHADERS_DEFAULT, "GPU",
+                     "Store shaders persistently and load them when loading games to avoid "
+                     "runtime spikes and freezes when playing the game not for the first time.");
+ 
+diff --git a/src/graphics/pipeline/shader/dxbc_translator.cpp b/src/graphics/pipeline/shader/dxbc_translator.cpp
+index 1f2aa90..c7facc3 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator.cpp
+@@ -18,13 +18,21 @@
+ 
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
++#include <rex/platform.h>
+ #include <rex/graphics/pipeline/shader/dxbc.h>
+ #include <rex/graphics/pipeline/shader/dxbc_translator.h>
+ #include <rex/graphics/xenos.h>
+ #include <rex/math.h>
+ #include <rex/ui/graphics_provider.h>
+ 
++// Xbox (UWP): the console's shader compiler crashes on, or miscompiles, the
++// big switch-based control flow (broken skin and bodies in UFC 3), so the
++// simpler if-based form is the default there.
++#if REX_PLATFORM_WINRT
++REXCVAR_DEFINE_BOOL(dxbc_switch, false, "GPU/Shader", "Use switch statements in DXBC");
++#else
+ REXCVAR_DEFINE_BOOL(dxbc_switch, true, "GPU/Shader", "Use switch statements in DXBC");
++#endif
+ 
+ REXCVAR_DEFINE_BOOL(dxbc_source_map, false, "GPU/Shader", "Generate source maps for DXBC");
+ 
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index cfb1dda..2c9d380 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -1665,10 +1665,12 @@ void TextureCache::UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t sub
+   textures_total_host_memory_usage_ = textures_total_host_memory_usage_ - subtract + add;
+ #if REX_PLATFORM_WINRT
+   {
+-    // Logged in 64 MB steps, to see how much of the app's memory textures use.
++    // Logged at each new high, in 64 MB steps, to see how much of the app's
++    // memory textures use (not on every change around a step, which repeats
++    // when the cache sits at its limit).
+     static uint64_t logged_step = 0;
+     const uint64_t step = textures_total_host_memory_usage_ >> 26;
+-    if (step != logged_step) {
++    if (step > logged_step) {
+       logged_step = step;
+       REXGPU_INFO("Texture cache: {} MB in {} textures",
+                   textures_total_host_memory_usage_ >> 20, textures_.size());
+-- 
+2.43.0
+

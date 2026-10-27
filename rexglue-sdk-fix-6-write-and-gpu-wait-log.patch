@@ -1,0 +1,133 @@
+From 3a0afad05622a0dd89bc3955582cf2e1e4e27401 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 01:24:42 -0400
+Subject: [PATCH] UWP: log slow/failed file writes and GPU memory waits that
+ don't end
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ include/rex/system/xfile.h         |  6 ++++++
+ src/graphics/command_processor.cpp | 19 +++++++++++++++++++
+ src/system/xfile.cpp               | 30 ++++++++++++++++++++++++++++++
+ 3 files changed, 55 insertions(+)
+
+diff --git a/include/rex/system/xfile.h b/include/rex/system/xfile.h
+index 6063f3c..caa31ca 100644
+--- a/include/rex/system/xfile.h
++++ b/include/rex/system/xfile.h
+@@ -110,6 +110,12 @@ class XFile : public XObject {
+ 
+   bool is_synchronous() const { return is_synchronous_; }
+ 
++  // Write statistics for the logs (Xbox: saves can be slow to write).
++  uint64_t log_bytes_written_ = 0;
++  uint32_t log_writes_ = 0;
++  double log_write_ms_ = 0.0;
++  uint64_t log_next_report_bytes_ = 4 * 1024 * 1024;
++
+   void SetFindPattern(const std::string_view pattern) {
+     find_engine_.SetRule(pattern);
+     find_index_ = 0;
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 2f80a7c..11d1c52 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -22,6 +22,9 @@
+ #include <rex/perf/counter.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/graphics/command_processor.h>
++#include <rex/platform.h>
++
++#include <chrono>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/graphics_system.h>
+ #include <rex/graphics/pipeline/texture/cache.h>
+@@ -1771,6 +1774,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+   bool is_memory = (wait_info & 0x10) != 0;
+ 
+   bool matched = false;
++#if REX_PLATFORM_WINRT
++  // A wait that never ends freezes the game: log what it waits for.
++  const auto wait_start = std::chrono::steady_clock::now();
++  auto next_wait_log = wait_start + std::chrono::seconds(3);
++#endif
+   do {
+     // The thread that will satisfy the wait may be waiting for a readback.
+     ServiceOnDemandReadbacks();
+@@ -1813,6 +1821,17 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         break;
+     }
+     if (!matched) {
++#if REX_PLATFORM_WINRT
++      const auto now = std::chrono::steady_clock::now();
++      if (now >= next_wait_log) {
++        next_wait_log = now + std::chrono::seconds(30);
++        REXGPU_WARN(
++            "GPU has waited {} s for {} {:08X} (function {}, reference {:08X}, mask {:08X}); "
++            "value is {:08X}",
++            std::chrono::duration_cast<std::chrono::seconds>(now - wait_start).count(),
++            is_memory ? "memory" : "register", poll_reg_addr, wait_info & 0x7, ref, mask, value);
++      }
++#endif
+       // Wait.
+       if (wait >= 0x100) {
+         PrepareForWait();
+diff --git a/src/system/xfile.cpp b/src/system/xfile.cpp
+index 87728b5..c1aecbc 100644
+--- a/src/system/xfile.cpp
++++ b/src/system/xfile.cpp
+@@ -11,6 +11,10 @@
+ 
+ #include <rex/filesystem/vfs.h>
+ #include <rex/logging.h>
++#include <rex/platform.h>
++
++#include <atomic>
++#include <chrono>
+ #include <rex/math.h>
+ #include <rex/memory.h>
+ #include <rex/memory/utils.h>
+@@ -282,6 +286,12 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
+   // The OS reads the buffer without our fault handling.
+   memory()->ProvidePhysicalMemoryData(buffer_guest_address, buffer_length);
+ 
++#if REX_PLATFORM_WINRT
++  if (buffer_length >= 1024 * 1024) {
++    REXSYS_INFO("File write: {} bytes at {} to {}", buffer_length, byte_offset, path());
++  }
++  const auto write_start = std::chrono::steady_clock::now();
++#endif
+   size_t bytes_written = 0;
+   X_STATUS result = file_->WriteSync(
+       std::span<const uint8_t>(memory()->TranslateVirtual(buffer_guest_address), buffer_length),
+@@ -289,6 +299,26 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
+   if (XSUCCEEDED(result)) {
+     position_ += bytes_written;
+   }
++#if REX_PLATFORM_WINRT
++  {
++    const double write_ms = std::chrono::duration<double, std::milli>(
++                                std::chrono::steady_clock::now() - write_start)
++                                .count();
++    ++log_writes_;
++    log_bytes_written_ += bytes_written;
++    log_write_ms_ += write_ms;
++    static std::atomic<uint32_t> problem_logs{0};
++    if ((XFAILED(result) || write_ms >= 100.0) && problem_logs.fetch_add(1) < 64) {
++      REXSYS_WARN("File write to {}: {} bytes at {} -> {} bytes, status {:08X}, {:.0f} ms", path(),
++                  buffer_length, byte_offset, bytes_written, uint32_t(result), write_ms);
++    }
++    if (log_bytes_written_ >= log_next_report_bytes_) {
++      log_next_report_bytes_ = log_bytes_written_ + 4 * 1024 * 1024;
++      REXSYS_INFO("File writes to {}: {} writes, {:.1f} MB, {:.0f} ms so far", path(), log_writes_,
++                  log_bytes_written_ / 1048576.0, log_write_ms_);
++    }
++  }
++#endif
+ 
+   XIOCompletion::IONotification notify;
+   notify.apc_context = apc_context;
+-- 
+2.43.0
+

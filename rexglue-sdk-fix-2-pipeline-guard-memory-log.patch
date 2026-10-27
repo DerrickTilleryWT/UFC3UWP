@@ -1,0 +1,200 @@
+From 62cddbe3755070e012fd10ec314a4787ccb8b221 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 20:21:24 -0400
+Subject: [PATCH] UWP: pipeline crash guard and logging; memory usage logging
+
+Log each pipeline before creating it and set the stored pipeline list aside
+if the previous run died while creating it (the Xbox driver can end the app
+on a pipeline). Log the app's memory use against its limit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ include/rex/platform/uwp.h            |  5 +++
+ src/core/platform_uwp.cpp             | 44 ++++++++++++++++++++++
+ src/graphics/d3d12/pipeline_cache.cpp | 54 +++++++++++++++++++++++++++
+ src/ui/windowed_app_main_uwp.cpp      |  1 +
+ 4 files changed, 104 insertions(+)
+
+diff --git a/include/rex/platform/uwp.h b/include/rex/platform/uwp.h
+index e38c3e8..0671361 100644
+--- a/include/rex/platform/uwp.h
++++ b/include/rex/platform/uwp.h
+@@ -55,6 +55,11 @@ void* LoadSystemLibrary(const wchar_t* name);
+ // std::terminate and C runtime invalid parameter errors. Call once, early.
+ void InstallCrashLogging();
+ 
++// Logs the app's memory use against the system's limit for it now and then
++// (an app over the limit is ended without a crash report). Call once, after
++// logging is set up.
++void StartMemoryUsageLogging();
++
+ }  // namespace rex::platform::uwp
+ 
+ #endif  // REX_PLATFORM_WINRT
+diff --git a/src/core/platform_uwp.cpp b/src/core/platform_uwp.cpp
+index 35b5169..c4ed5fb 100644
+--- a/src/core/platform_uwp.cpp
++++ b/src/core/platform_uwp.cpp
+@@ -16,9 +16,12 @@
+ #include <wrl/client.h>
+ 
+ #include <windows.storage.h>
++#include <windows.system.h>
+ 
+ #include <atomic>
++#include <chrono>
+ #include <cstdint>
++#include <thread>
+ #include <cstdlib>
+ #include <exception>
+ #include <iterator>
+@@ -387,6 +390,47 @@ void InstallCrashLogging() {
+   _set_invalid_parameter_handler(InvalidParameterHandler);
+ }
+ 
++void StartMemoryUsageLogging() {
++  static std::atomic<bool> started{false};
++  if (started.exchange(true)) {
++    return;
++  }
++  std::thread([] {
++    using Microsoft::WRL::ComPtr;
++    namespace system = ABI::Windows::System;
++    RoInitialize(RO_INIT_MULTITHREADED);
++    static const wchar_t kClassName[] = L"Windows.System.MemoryManager";
++    HSTRING_HEADER class_name_header;
++    HSTRING class_name = nullptr;
++    ComPtr<system::IMemoryManagerStatics> memory_manager;
++    if (FAILED(WindowsCreateStringReference(kClassName, UINT32(std::size(kClassName) - 1),
++                                            &class_name_header, &class_name)) ||
++        FAILED(RoGetActivationFactory(class_name,
++                                      IID_PPV_ARGS(memory_manager.GetAddressOf())))) {
++      spdlog::warn("UWP: memory usage isn't available (Windows.System.MemoryManager)");
++      return;
++    }
++    // Every 10 seconds, and right away when usage crosses another 10% of the
++    // limit: an app over its limit is ended by the system without a crash.
++    uint64_t last_logged_tenth = UINT64_MAX;
++    auto last_log = std::chrono::steady_clock::now() - std::chrono::seconds(10);
++    while (true) {
++      UINT64 usage = 0, limit = 0;
++      memory_manager->get_AppMemoryUsage(&usage);
++      memory_manager->get_AppMemoryUsageLimit(&limit);
++      uint64_t tenth = limit ? usage * 10 / limit : 0;
++      auto now = std::chrono::steady_clock::now();
++      if (tenth != last_logged_tenth || now - last_log >= std::chrono::seconds(10)) {
++        auto log = tenth >= 9 ? spdlog::level::warn : spdlog::level::info;
++        spdlog::log(log, "UWP: memory {} MB used of {} MB allowed", usage >> 20, limit >> 20);
++        last_logged_tenth = tenth;
++        last_log = now;
++      }
++      std::this_thread::sleep_for(std::chrono::milliseconds(500));
++    }
++  }).detach();
++}
++
+ }  // namespace rex::platform::uwp
+ 
+ #endif  // REX_PLATFORM_WINRT
+diff --git a/src/graphics/d3d12/pipeline_cache.cpp b/src/graphics/d3d12/pipeline_cache.cpp
+index 0b8f973..f44862a 100644
+--- a/src/graphics/d3d12/pipeline_cache.cpp
++++ b/src/graphics/d3d12/pipeline_cache.cpp
+@@ -251,6 +251,31 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
+   auto pipeline_storage_file_path =
+       shader_storage_shareable_root /
+       fmt::format("{:08X}.{}.d3d12.xpso", title_id, edram_rov_used ? "rov" : "rtv");
++#if REX_PLATFORM_WINRT
++  // Crash guard for consoles: if the previous run died while creating the
++  // stored pipelines (the Xbox driver can take the whole app down on a
++  // pipeline it dislikes), the same pipelines would crash every launch. A
++  // marker file brackets the creation; if it's still there, the stored
++  // pipeline list is set aside (renamed to .bad) and started over.
++  std::filesystem::path pipeline_storage_loading_marker = pipeline_storage_file_path;
++  pipeline_storage_loading_marker += ".loading";
++  {
++    std::error_code error;
++    if (std::filesystem::exists(pipeline_storage_loading_marker, error)) {
++      std::filesystem::path bad_path = pipeline_storage_file_path;
++      bad_path += ".bad";
++      std::filesystem::remove(bad_path, error);
++      std::filesystem::rename(pipeline_storage_file_path, bad_path, error);
++      REXGPU_WARN(
++          "The last run stopped while creating the stored pipelines - set them aside "
++          "({}) and starting a new pipeline list",
++          rex::path_to_utf8(bad_path.filename()));
++    }
++    if (FILE* marker = rex::filesystem::OpenFile(pipeline_storage_loading_marker, "wb")) {
++      fclose(marker);
++    }
++  }
++#endif
+   pipeline_storage_file_ = rex::filesystem::OpenFile(pipeline_storage_file_path, "a+b");
+   if (!pipeline_storage_file_) {
+     REXGPU_ERROR(
+@@ -705,6 +730,12 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
+     fwrite(&pipeline_storage_file_header, sizeof(pipeline_storage_file_header), 1,
+            pipeline_storage_file_);
+   }
++#if REX_PLATFORM_WINRT
++  {
++    std::error_code error;
++    std::filesystem::remove(pipeline_storage_loading_marker, error);
++  }
++#endif
+ 
+   shader_storage_cache_root_ = cache_root;
+   shader_storage_title_id_ = title_id;
+@@ -2683,6 +2714,28 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
+     const PipelineRuntimeDescription& runtime_description) {
+   const PipelineDescription& description = runtime_description.description;
+ 
++#if REX_PLATFORM_WINRT
++  // Logged before the driver call on Xbox, where a pipeline the driver can't
++  // handle may end the app: the log's last lines then name it.
++  {
++    const PipelineRenderTarget& rt0 = description.render_targets[0];
++    REXGPU_INFO(
++        "Creating graphics pipeline VS {:016X}/{:X} PS {:016X}/{:X}: topology/tess {} GS {} "
++        "cull {} MSAA {} depth fmt {} func {} write {} stencil {} RT0 {} fmt {} blend {}/{}/{}",
++        runtime_description.vertex_shader->shader().ucode_data_hash(),
++        description.vertex_shader_modification,
++        runtime_description.pixel_shader
++            ? runtime_description.pixel_shader->shader().ucode_data_hash()
++            : uint64_t(0),
++        description.pixel_shader_modification,
++        uint32_t(description.primitive_topology_type_or_tessellation_mode),
++        uint32_t(description.geometry_shader), uint32_t(description.cull_mode),
++        1u << uint32_t(description.host_msaa_samples), uint32_t(description.depth_format),
++        uint32_t(description.depth_func), uint32_t(description.depth_write),
++        uint32_t(description.stencil_enable), uint32_t(rt0.used), uint32_t(rt0.format),
++        uint32_t(rt0.src_blend), uint32_t(rt0.dest_blend), uint32_t(rt0.blend_op));
++  }
++#else
+   if (runtime_description.pixel_shader != nullptr) {
+     REXGPU_DEBUG("Creating graphics pipeline with VS {:016X}, PS {:016X}",
+                  runtime_description.vertex_shader->shader().ucode_data_hash(),
+@@ -2691,6 +2744,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
+     REXGPU_DEBUG("Creating graphics pipeline with VS {:016X}",
+                  runtime_description.vertex_shader->shader().ucode_data_hash());
+   }
++#endif
+ 
+   D3D12_GRAPHICS_PIPELINE_STATE_DESC state_desc;
+   std::memset(&state_desc, 0, sizeof(state_desc));
+diff --git a/src/ui/windowed_app_main_uwp.cpp b/src/ui/windowed_app_main_uwp.cpp
+index a2f7c8f..8e6c210 100644
+--- a/src/ui/windowed_app_main_uwp.cpp
++++ b/src/ui/windowed_app_main_uwp.cpp
+@@ -129,6 +129,7 @@ int RunWindowedApp(IUnknown* core_window) {
+ 
+     if (app->OnInitialize()) {
+       REXLOG_INFO("UWP: app initialized, running the UI loop");
++      rex::platform::uwp::StartMemoryUsageLogging();
+       // Settings from LocalState/args.txt, so the log shows what was used.
+       if (utf8_args.size() > 1) {
+         for (size_t i = 1; i < utf8_args.size(); ++i) {
+-- 
+2.43.0
+

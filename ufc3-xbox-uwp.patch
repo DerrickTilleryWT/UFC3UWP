@@ -1,0 +1,148 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1685a80..251cead 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -22,3 +22,14 @@ else()
+ endif()
+ 
+ rexglue_setup_target(ufc3 GPU_PLUGINS xenos)
++
++if(REXGLUE_UWP)
++    # Xbox Series X|S Developer Mode: UWP package layout (and .msix target).
++    rexglue_uwp_app(ufc3
++        NAME "ReXGlue.UFC3"
++        DISPLAY_NAME "UFC Undisputed 3"
++        PUBLISHER "CN=ReXGlue"
++        PUBLISHER_DISPLAY_NAME "UFC3ReX"
++        DESCRIPTION "UFC Undisputed 3 Recompiled"
++        VERSION "1.0.6.0")
++endif()
+diff --git a/CMakePresets.json b/CMakePresets.json
+index ea2e604..2b61fb6 100644
+--- a/CMakePresets.json
++++ b/CMakePresets.json
+@@ -88,6 +88,14 @@
+             "inherits": "windows-base",
+             "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+         },
++        {
++            "name": "uwp-amd64-release",
++            "displayName": "Xbox (UWP) Release",
++            "description": "Xbox Series X|S Developer Mode. Needs a UWP build of the SDK in UFC3_SDK_UWP; configure from 'vcvarsall.bat x64 uwp'.",
++            "inherits": "windows-base",
++            "toolchainFile": "$penv{UFC3_SDK_UWP}/share/rexglue/uwp/rexglue_uwp_toolchain_file.cmake",
++            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
++        },
+         {
+             "name": "linux-amd64-debug",
+             "displayName": "Linux AMD64 Debug",
+@@ -188,6 +196,7 @@
+     "buildPresets": [
+         { "name": "win-amd64-debug", "configurePreset": "win-amd64-debug" },
+         { "name": "win-amd64-release", "configurePreset": "win-amd64-release" },
++        { "name": "uwp-amd64-release", "configurePreset": "uwp-amd64-release" },
+         { "name": "win-amd64-relwithdebinfo", "configurePreset": "win-amd64-relwithdebinfo" },
+         { "name": "linux-amd64-debug", "configurePreset": "linux-amd64-debug" },
+         { "name": "linux-amd64-release", "configurePreset": "linux-amd64-release" },
+diff --git a/src/import_trace.h b/src/import_trace.h
+index 40be4ed..990beed 100644
+--- a/src/import_trace.h
++++ b/src/import_trace.h
+@@ -13,6 +13,7 @@
+ #include <windows.h>
+ 
+ #include <rex/cvar.h>
++#include <rex/platform.h>
+ #include <rex/logging.h>
+ #include <rex/ppc/func.h>
+ 
+@@ -25,8 +26,15 @@ using ImportFn = void (*)(PPCContext&, uint8_t*);
+ 
+ inline ImportFn Resolve(const char* name) {
+   static HMODULE runtime = [] {
++#if REX_PLATFORM_WINRT
++    // No GetModuleHandle for UWP apps; LoadPackagedLibrary returns the
++    // already-loaded runtime DLL from the package.
++    HMODULE m = LoadPackagedLibrary(L"rexruntimerd.dll", 0);
++    return m ? m : LoadPackagedLibrary(L"rexruntime.dll", 0);
++#else
+     HMODULE m = GetModuleHandleA("rexruntimerd.dll");
+     return m ? m : GetModuleHandleA("rexruntime.dll");
++#endif
+   }();
+   return reinterpret_cast<ImportFn>(GetProcAddress(runtime, name));
+ }
+diff --git a/src/main.cpp b/src/main.cpp
+index 80cb57f..661ace3 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -5,7 +5,11 @@
+ #include "ufc3_app.h"
+ #include "first_run_save.h"
+ #include "import_trace.h"
++#include <rex/platform.h>
++#if !REX_PLATFORM_WINRT
++// Desktop-only diagnostics (thread snapshots, symbol lookup).
+ #include "perf_probe.h"
++#endif
+ #include "cutscene_60.h"
+ #include "legacy_roster.h"
+ #include "heap_trace.h"
+diff --git a/src/music_player.h b/src/music_player.h
+index 709a47d..7bb4e71 100644
+--- a/src/music_player.h
++++ b/src/music_player.h
+@@ -32,7 +32,9 @@
+ #pragma comment(lib, "mfreadwrite.lib")
+ #pragma comment(lib, "mfuuid.lib")
+ #pragma comment(lib, "xaudio2.lib")
++#if !REX_PLATFORM_WINRT  // WindowsApp.lib provides COM on UWP.
+ #pragma comment(lib, "ole32.lib")
++#endif
+ 
+ namespace ufc3_music {
+ 
+diff --git a/src/ufc3_app.h b/src/ufc3_app.h
+index 8408417..e82126e 100644
+--- a/src/ufc3_app.h
++++ b/src/ufc3_app.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <rex/cvar.h>
++#include <rex/platform.h>
+ #include <rex/filesystem.h>
+ #include <rex/rex_app.h>
+ #include <rex/system/gpu_plugin.h>
+@@ -15,8 +16,14 @@
+ // 60 and it doesn't black out while a fighter is rocked, which D3D12 does.
+ // Without the hoist, Vulkan ends the render pass for every small upload (this
+ // game streams vertex data a page per draw) and drops to ~47 FPS at scale 3.
++#if REX_PLATFORM_WINRT
++// Xbox (UWP): Direct3D 12 is the only graphics API there.
++REXCVAR_DEFINE_STRING(gpu_backend, "d3d12", "GPU",
++                      "Graphics backend: vulkan or d3d12");
++#else
+ REXCVAR_DEFINE_STRING(gpu_backend, "vulkan", "GPU",
+                       "Graphics backend: vulkan or d3d12");
++#endif
+ REXCVAR_DEFINE_BOOL(ufc3_vulkan_hoist, true, "ufc3",
+                     "Vulkan: batch shared-memory uploads at the start of each submission "
+                     "(sets vulkan_shared_memory_hoist_uploads; fixes the black screen while rocked)");
+@@ -64,12 +71,16 @@ class Ufc3App : public rex::ReXApp {
+     // folder keeps them. Explicit cvars/toml paths still win.
+     auto exe_dir = rex::filesystem::GetExecutableFolder();
+     std::error_code ec;
++#if !REX_PLATFORM_WINRT
++    // (Not on Xbox (UWP): the install folder is read-only there, so saves stay
++    // in the SDK's default, the app's LocalState folder, LocalState\ufc3.)
+     if (rex::cvar::GetFlagByName("user_data_root").empty() &&
+         !std::filesystem::is_directory(exe_dir / ".." / "saves", ec)) {
+       bool cache_was_default = paths.cache_root == paths.user_data_root / "cache";
+       paths.user_data_root = exe_dir / "userdata";
+       if (cache_was_default) paths.cache_root = paths.user_data_root / "cache";
+     }
++#endif
+     if (rex::cvar::GetFlagByName("mods_root").empty() &&
+         std::filesystem::is_directory(exe_dir / "mods", ec)) {
+       rex::cvar::SetFlagByName("mods_root", (exe_dir / "mods").string());

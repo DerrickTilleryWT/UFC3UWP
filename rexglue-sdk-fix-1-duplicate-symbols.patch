@@ -1,0 +1,92 @@
+From 1567252ec19306a1d141aaa997b88620443c4197 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 18:51:50 -0400
+Subject: [PATCH] UWP: drop definitions that now live in shared code
+ (MenuItem::Create, guide_button)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ include/rex/ui/window_uwp.h                |  8 --------
+ src/audio/xaudio2/xaudio2_audio_driver.cpp |  4 +---
+ src/input/winrt/winrt_input_driver.cpp     | 12 ++++--------
+ src/ui/window_uwp.cpp                      |  6 ------
+ 4 files changed, 5 insertions(+), 25 deletions(-)
+
+diff --git a/include/rex/ui/window_uwp.h b/include/rex/ui/window_uwp.h
+index c12acb0..41acc4b 100644
+--- a/include/rex/ui/window_uwp.h
++++ b/include/rex/ui/window_uwp.h
+@@ -57,14 +57,6 @@ class UWPWindow final : public Window {
+   bool is_open_ = false;
+ };
+ 
+-// Menus aren't shown on UWP; this only keeps the menu tree (and callbacks)
+-// alive so shared code can build menus unconditionally.
+-class UWPMenuItem final : public MenuItem {
+- public:
+-  UWPMenuItem(Type type, const std::string& text, const std::string& hotkey,
+-              std::function<void()> callback)
+-      : MenuItem(type, text, hotkey, std::move(callback)) {}
+-};
+ 
+ }  // namespace ui
+ }  // namespace rex
+diff --git a/src/audio/xaudio2/xaudio2_audio_driver.cpp b/src/audio/xaudio2/xaudio2_audio_driver.cpp
+index 46bf02a..cc9cd7f 100644
+--- a/src/audio/xaudio2/xaudio2_audio_driver.cpp
++++ b/src/audio/xaudio2/xaudio2_audio_driver.cpp
+@@ -23,9 +23,7 @@
+ #include <rex/logging.h>
+ 
+ // Defined by the SDL driver on other platforms.
+-REXCVAR_DEFINE_BOOL(audio_mute, false,
+-    "Mute audio output",
+-    "Audio");
++REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+ 
+ namespace rex::audio::xaudio2 {
+ 
+diff --git a/src/input/winrt/winrt_input_driver.cpp b/src/input/winrt/winrt_input_driver.cpp
+index 0860e3c..7502a78 100644
+--- a/src/input/winrt/winrt_input_driver.cpp
++++ b/src/input/winrt/winrt_input_driver.cpp
+@@ -33,14 +33,10 @@
+ #include <rex/chrono/clock.h>
+ #include <rex/ui/virtual_key.h>
+ 
+-// Defined by the SDL driver on other platforms.
+-REXCVAR_DEFINE_BOOL(guide_button, false,
+-    "Enable guide button pass-through",
+-    "Input");
+-
+-REXCVAR_DEFINE_STRING(hid_mappings_file, "",
+-    "Path to SDL gamecontroller mappings file (unused on UWP)",
+-    "Input");
++// Defined by the SDL driver on other platforms (guide_button is defined by
++// the input system).
++REXCVAR_DEFINE_STRING(hid_mappings_file, "", "Input",
++                      "Path to SDL gamecontroller mappings file (unused on UWP)");
+ 
+ namespace rex::input::winrt {
+ 
+diff --git a/src/ui/window_uwp.cpp b/src/ui/window_uwp.cpp
+index dd0d039..0a5d51f 100644
+--- a/src/ui/window_uwp.cpp
++++ b/src/ui/window_uwp.cpp
+@@ -36,12 +36,6 @@ std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
+   return std::make_unique<UWPWindow>(app_context, title, 0, 0);
+ }
+ 
+-std::unique_ptr<MenuItem> MenuItem::Create(Type type, const std::string& text,
+-                                           const std::string& hotkey,
+-                                           std::function<void()> callback) {
+-  return std::make_unique<UWPMenuItem>(type, text, hotkey, std::move(callback));
+-}
+-
+ UWPWindow::UWPWindow(WindowedAppContext& app_context,
+                      const std::string_view title,
+                      uint32_t desired_logical_width,
+-- 
+2.43.0
+
